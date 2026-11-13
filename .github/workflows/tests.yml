@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu-tests:
+    # Model-free parts only (skeleton, filters, tracker, protocol, calibration, synthetic
+    # hands). Tests that need dex-retargeting / pinocchio or the GPU model are skipped.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy scipy msgpack pyzmq opencv-python-headless pytest
+      - run: pip install --no-deps -e .
+      - run: pytest -q tests
