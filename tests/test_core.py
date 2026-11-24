@@ -313,3 +313,269 @@ def test_synthetic_hands_grasp_and_roundtrip():
     assert [h["side"] for h in msg["hands"]] == ["left", "right"] and msg["seq"] == 7
     wrist_w = msg["hands"][0]["openxr26_positions"][1] @ T[:3, :3].T + T[:3, 3]
     assert -0.3 < wrist_w[0] < 0 and 0.15 < wrist_w[1] < 0.45 and 0.05 < wrist_w[2] < 0.2  # left, over the desk
+
+
+def test_camera_calibration_recovers_lens():
+    import cv2
+
+    from egohand_live.camcal import board_points, calibrate, egopost_json, view_descriptor
+    from egohand_live.targets import Detection
+
+    K = np.array([[910.0, 0, 655.0], [0, 905.0, 352.0], [0, 0, 1]])
+    dist = np.array([-0.32, 0.12, 0.001, -0.0005, -0.02])  # cheap-webcam barrel distortion
+    cols, rows, size = 9, 6, (1280, 720)
+    obj = board_points(cols, rows) * 0.025
+    rng = np.random.default_rng(1)
+
+    def random_views(n, noise=0.2):
+        out = []
+        while len(out) < n:
+            rvec = rng.uniform([-0.6, -0.6, -0.4], [0.6, 0.6, 0.4])
+            tvec = np.array([rng.uniform(-0.15, 0.05), rng.uniform(-0.1, 0.02), rng.uniform(0.35, 0.7)])
+            px, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
+            px = px.reshape(-1, 2) + rng.normal(0, noise, (len(obj), 2))
+            if (px.min(0) > 10).all() and (px.max(0) < np.array(size) - 10).all():
+                out.append(Detection(np.arange(len(obj)), obj.astype(np.float32), px.astype(np.float32)))
+        return out
+
+    views = random_views(15)
+    K_est, d_est, rms, per_view = calibrate(views, size, "standard")
+    assert rms < 0.5 and per_view.max() < 1.0
+    assert np.allclose(np.diag(K_est)[:2], np.diag(K)[:2], rtol=0.01)
+    assert np.allclose(K_est[:2, 2], K[:2, 2], atol=6)
+    # Held-out views (noise-free) reproject with the estimated lens to well under a pixel.
+    for v in random_views(5, noise=0.0):
+        ok, rvec, tvec = cv2.solvePnP(obj, v.img, K_est, d_est)
+        proj, _ = cv2.projectPoints(obj, rvec, tvec, K_est, d_est)
+        assert ok and np.abs(proj.reshape(-1, 2) - v.img).max() < 1.0
+    cal = egopost_json(K_est, d_est, size)
+    assert cal["model"] == "RATIONAL_POLYNOMIAL" and len(cal["distortion_coefficients"]) == 14
+    assert len(view_descriptor(views[0], size, 0.2)) == 5
+
+
+def test_fisheye_lens_from_partial_charuco_views():
+    """A wide lens calibrated from ChArUco views that leave the image: auto picks the fisheye model."""
+    import cv2
+
+    from egohand_live.camcal import calibrate_best, egopost_json
+    from egohand_live.targets import Charuco, Detection
+
+    K = np.array([[420.0, 0, 642.0], [0, 421.0, 357.0], [0, 0, 1]])  # ~140 deg wide at 1280 px
+    D = np.array([0.05, -0.02, 0.004, -0.001])
+    size = (1280, 720)
+    board = Charuco(9, 7, 0.027, 0.020, "5X5_100")
+    rng = np.random.default_rng(3)
+    views = []
+    while len(views) < 18:
+        rvec = rng.uniform([-0.7, -0.7, -0.5], [0.7, 0.7, 0.5])
+        tvec = np.array([rng.uniform(-0.25, 0.1), rng.uniform(-0.15, 0.05), rng.uniform(0.18, 0.45)])
+        cam = board.points @ cv2.Rodrigues(rvec)[0].T + tvec
+        if (cam[:, 2] < 0.05).any():
+            continue
+        px = cv2.fisheye.projectPoints(board.points.reshape(-1, 1, 3).astype(np.float64), rvec, tvec, K, D)[0]
+        px = px.reshape(-1, 2) + rng.normal(0, 0.15, (len(board.points), 2))
+        inside = ((px > 5) & (px < np.array(size) - 5)).all(1)
+        if inside.sum() >= 12:  # partial views are fine
+            ids = np.where(inside)[0]
+            views.append(Detection(ids, board.points[ids], px[ids].astype(np.float32)))
+    model, K_est, d_est, rms, _ = calibrate_best(views, size, "auto")
+    assert model == "kb4" and rms < 0.4
+    assert np.allclose(np.diag(K_est)[:2], np.diag(K)[:2], rtol=0.01)
+    assert egopost_json(K_est, d_est, size, model)["model"] == "KB4"
+
+
+def test_charuco_board_identified_from_image():
+    import cv2
+
+    from egohand_live.targets import Charuco, identify_charuco, parse_board
+
+    truth = Charuco(9, 7, 0.027, 0.020, "5X5_100")
+    img = truth.board.generateImage((9 * 60, 7 * 60), marginSize=40)
+    H = np.array([[0.9, 0.12, 200], [-0.05, 0.85, 80], [1e-4, 2e-4, 1]])  # board lying on a desk, seen at an angle
+    img = cv2.warpPerspective(img, H, (1280, 720), borderValue=255)
+    found = identify_charuco(img, 0.027)
+    assert (found.squares_x, found.squares_y, found.legacy) == (9, 7, False)
+    assert found.dictionary.startswith("5X5") and abs(found.marker - 0.020) < 0.0025
+    det = parse_board(found.spec).detect(img)
+    assert det is not None and len(det.ids) == 48
+
+
+def test_rotated_intrinsics_match_rotated_image():
+    import cv2
+
+    from egohand_live.sources import rotate_K
+
+    K = np.array([[900, 0, 610], [0, 880, 350], [0, 0, 1]], np.float32)
+    W, H, P = 1280, 720, np.array([0.12, -0.05, 0.6])
+    u, v = (K @ P)[:2] / P[2]
+    img = np.zeros((H, W), np.uint8)
+    img[int(round(v)), int(round(u))] = 255
+    for deg, code, R in ((90, cv2.ROTATE_90_CLOCKWISE, [[0, -1, 0], [1, 0, 0], [0, 0, 1]]),
+                         (180, cv2.ROTATE_180, [[-1, 0, 0], [0, -1, 0], [0, 0, 1]]),
+                         (270, cv2.ROTATE_90_COUNTERCLOCKWISE, [[0, 1, 0], [-1, 0, 0], [0, 0, 1]])):  # fmt: skip
+        vv, uu = np.argwhere(cv2.rotate(img, code) == 255)[0]
+        P2 = np.array(R) @ P
+        u2, v2 = (rotate_K(K, W, H, deg) @ P2)[:2] / P2[2]
+        assert abs(u2 - uu) < 0.6 and abs(v2 - vv) < 0.6
+
+
+def test_desk_frame_from_hand_touches():
+    from egohand_live.calibrate import desk_frame_from_points
+
+    # Camera 0.7 m above the desk, looking down 60 deg, operator's hands at the image bottom.
+    t = np.radians(60)
+    R_wc = np.array([[1, 0, 0], [0, -np.sin(t), np.cos(t)], [0, -np.cos(t), -np.sin(t)]])  # columns: cam axes
+    cam = np.array([0.05, -0.1, 0.7])
+    touches_w = np.array([[-0.2, 0.2, 0], [0.2, 0.25, 0], [0.0, 0.45, 0], [-0.15, 0.4, 0], [0.18, 0.5, 0.0]])
+    touches_c = (touches_w - cam) @ R_wc + np.random.default_rng(0).normal(0, 0.002, touches_w.shape)
+    T, rms = desk_frame_from_points(touches_c)
+    assert rms < 0.004
+    assert np.allclose(T[:3, :3], R_wc, atol=0.02)  # same axes as the true camera pose
+    assert abs(T[2, 3] - 0.7) < 0.01  # camera height above the desk
+    centre = touches_c.mean(0) @ T[:3, :3].T + T[:3, 3]
+    assert np.allclose(centre, [0.0, 0.3, 0.0], atol=1e-6)
+
+    from egohand_live.calibrate import spread_hint
+
+    assert spread_hint(touches_c) is None  # an area: plane determined
+    row_w = np.array([[x, 0.3, 0.0] for x in (-0.25, -0.1, 0.05, 0.2, 0.3)])  # one row across the desk
+    row_c = (row_w - cam) @ R_wc
+    assert spread_hint(row_c) == "nearer to you or further away"
+    col_c = (np.array([[0.0, y, 0.0] for y in (0.15, 0.25, 0.35, 0.45, 0.55)]) - cam) @ R_wc
+    assert spread_hint(col_c) == "further left or right"
+
+
+def test_desk_pose_from_board():
+    from egohand_live.calibrate import board_pose, desk_frame_from_points
+
+    # Camera 0.9 m above the desk, looking down 50 deg; a 9x6 board (12 mm squares) lying on it.
+    t = np.radians(50)
+    R_wc = np.array([[1, 0, 0], [0, -np.sin(t), np.cos(t)], [0, -np.cos(t), -np.sin(t)]])
+    cam = np.array([0.0, -0.4, 0.9])
+    K = np.array([[1174.0, 0, 640], [0, 1174, 360], [0, 0, 1]])
+    yaw = np.radians(20)  # board turned on the desk; must not matter
+    sq = 0.012
+    board_w = np.array([[c * sq, r * sq, 0.0] for r in range(6) for c in range(9)])
+    board_w = board_w @ np.array([[np.cos(yaw), np.sin(yaw), 0], [-np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+    board_w += [0.0, 0.3, 0.0]
+    pc = (board_w - cam) @ R_wc
+    uv = (pc @ K.T)[:, :2] / pc[:, 2:3] + np.random.default_rng(1).normal(0, 0.1, (54, 2))
+    obj = np.array([[c * sq, r * sq, 0.0] for r in range(6) for c in range(9)])
+    P = board_pose(obj, uv.astype(np.float32), K)
+    assert np.abs(P - pc).max() < 0.005
+    T, rms = desk_frame_from_points(P)
+    assert rms < 1e-3
+    assert np.allclose(T[:3, :3], R_wc, atol=0.01)
+    assert abs(T[2, 3] - 0.9) < 0.005
+
+
+def test_depth_scale_from_resting_hands():
+    """Hands resting on a known desk, tracked 13 % too close: calibrate-depth recovers 1/0.87."""
+    import tempfile
+    import threading
+    import time as _time
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from egohand_live.calibrate import PALM_JOINTS, PALM_THICKNESS, depth_scale_from_hands
+    from egohand_live.protocol import Publisher
+    from egohand_live.synthetic import DEFAULT_T_WORLD_CAMERA as T, IMAGE_SIZE, K, synthetic_hand
+    from egohand_live.skeleton import soma25_to_openxr26
+
+    R_wc, t_wc = T[:3, :3], T[:3, 3]
+    spots = [("left", -0.12, 0.25), ("right", 0.10, 0.30), ("left", 0.0, 0.42), ("right", 0.15, 0.40)]
+    port = 5600 + int(_time.time() * 1000) % 300
+    stop = threading.Event()
+    ext = Path(tempfile.mkdtemp()) / "T.txt"
+    np.savetxt(ext, T)
+
+    def hand_msg(side, x, y, t, seq):
+        j = synthetic_hand(side, 0.0)
+        palm = soma25_to_openxr26(j, side)[0][PALM_JOINTS].mean(0)
+        j = j + np.array([x, y, PALM_THICKNESS]) - palm  # palm underside on the desk (z = 0)
+        jc = (j - t_wc) @ R_wc
+        uv = jc @ K.T
+        p, q, r = soma25_to_openxr26(jc * 0.87, side)  # monocular depth 13 % short, same rays
+        h = SimpleNamespace(side=side, score=0.9, held=False, bbox=np.zeros(3, np.float32),
+                            joints_cam=(jc * 0.87).astype(np.float32),
+                            keypoints_2d=(uv[:, :2] / uv[:, 2:]).astype(np.float32),
+                            openxr_positions=p, openxr_orientations=q, openxr_radii=r)  # fmt: skip
+        return SimpleNamespace(index=seq, t_capture=t, image_size=IMAGE_SIZE, K=K.astype(np.float32),
+                               timings_ms={}, hands={side: h}, depth_scale=1.0)  # fmt: skip
+
+    def publish():
+        pub = Publisher(f"tcp://127.0.0.1:{port}")
+        t, seq = 0.0, 0
+        while not stop.is_set():
+            for side, x, y in spots:
+                for _ in range(60):  # 2 s still at each spot (synthetic clock, 30 fps)
+                    if stop.is_set():
+                        break
+                    pub.publish(hand_msg(side, x, y, t, seq))
+                    t, seq = t + 1 / 30, seq + 1
+                    _time.sleep(0.002)
+        pub.close()
+
+    th = threading.Thread(target=publish, daemon=True)
+    th.start()
+    try:
+        scale = depth_scale_from_hands(f"tcp://127.0.0.1:{port}", str(ext), spots=3)
+    finally:
+        stop.set()
+        th.join(2)
+    assert abs(scale - 1 / 0.87) < 0.01
+
+
+def test_gripper_teleop_pose_and_pinch():
+    from scipy.spatial.transform import Rotation as R_
+
+    from egohand_live.gripper_teleop import PinchGripper, desk_to_task, ee_target, transform_hand
+    from egohand_live.skeleton import soma25_to_openxr26
+    from egohand_live.synthetic import synthetic_hand
+
+    T = desk_to_task(task_centre=(0.5, 0.0, 0.0))
+    assert np.allclose(T[:3, :3] @ [0, 0.3, 0] + T[:3, 3], [0.5, 0, 0])  # desk centre -> task centre
+    for curl, side in ((0.0, "right"), (1.0, "right"), (0.0, "left")):
+        j = synthetic_hand(side, curl) + [0.05, 0.3, 0.06]  # palm down, fingers away from the operator
+        p, q, _ = soma25_to_openxr26(j, side)
+        pt, qt = transform_hand(T, p, q)
+        for mode in ("yaw", "full"):
+            pos, quat_xyzw, width = ee_target(pt, qt, rotation=mode)
+            Rm = R_.from_quat(quat_xyzw).as_matrix()
+            # Franka top grasp: x forward (task +x), approach z down
+            assert Rm[:, 0] @ [1, 0, 0] > 0.97 and Rm[:, 2] @ [0, 0, -1] > 0.97, (side, curl, mode)
+            tcp = 0.5 * (pt[5] + pt[10])
+            assert np.allclose(pos, [tcp[0], tcp[1], max(tcp[2], 0.005) + 0.1034], atol=0.02)
+        assert (width < 0.02) == (curl == 1.0)
+    g = PinchGripper()
+    assert [g(w) for w in (0.08, 0.04, 0.02, 0.04, 0.06)] == [1.0, 1.0, -1.0, -1.0, 1.0]  # hysteresis
+    c = PinchGripper("continuous")
+    assert c(0.0) == 0.0 and c(0.2) == 1.0 and 0.4 < c(0.0475) < 0.6
+
+
+def test_session_roundtrip_and_video_timeline():
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from egohand_live.session import SessionWriter, load_session
+    from egohand_live.video import frame_indices, timeline
+
+    d = tempfile.mkdtemp()
+    hand = SimpleNamespace(side="left", score=0.9, held=False, bbox=np.ones(3), joints_cam=np.ones((25, 3)),
+                           keypoints_2d=np.ones((25, 2)), openxr_positions=np.ones((26, 3)),
+                           openxr_orientations=np.ones((26, 4)), vertices_cam=np.ones((10, 3)))
+    w = SessionWriter(d, {"image_size": [64, 36]}, faces={"left": np.zeros((4, 3), int)})
+    for i in range(5):
+        res = SimpleNamespace(index=i, t_capture=10 + i / 15, K=np.eye(3), timings_ms={"total": 1.0},
+                              hands={"left": hand})
+        w.add(np.zeros((36, 64, 3), np.uint8), res)
+    w.close()
+    meta, faces, recs = load_session(d)
+    assert meta["image_size"] == [64, 36] and faces["left"].shape == (4, 3) and len(recs) == 5
+    assert recs[2]["hands"][0]["verts"].shape == (10, 3) and Path(recs[2]["frame"]).exists()
+    idx = frame_indices(np.array([r["t"] for r in recs]), fps=30)  # 15 fps recording -> 30 fps video
+    assert list(idx[:4]) == [0, 0, 1, 1]
+    plan = timeline(300, 30.0, [("a",), ("b",), ("c",)], step_s=4.0)  # 10 s, 3 steps
+    assert plan[0] == (0, None, 1.0) and plan[-1][0] == 2
+    assert any(p[1] == 0 and 0 < p[2] < 1 for p in plan)  # a wipe from step 0 to step 1

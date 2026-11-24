@@ -133,8 +133,6 @@ class WebcamSource(Source):
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.K = load_intrinsics(intrinsics, w, h) if intrinsics else estimate_K(w, h)
-        if not intrinsics:
-            log.warning("No --intrinsics for webcam; using f=max(w,h). Depth will be off.")
         log.info("Webcam %d: %dx%d @ %.0f fps", device, w, h, self.cap.get(cv2.CAP_PROP_FPS))
         self._i = 0
         self._reader = _LatestFrameThread(self._grab, "webcam")
@@ -430,6 +428,52 @@ class RectifiedSource(Source):
         return getattr(self.base, name)
 
 
+_ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+
+def rotate_K(K: np.ndarray, width: int, height: int, degrees: int) -> np.ndarray:
+    """Intrinsics of the image rotated clockwise by ``degrees`` (a rotation about the optical
+    axis, so the result is still an exact pinhole camera)."""
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    if degrees == 180:  # (u, v) -> (W-1-u, H-1-v)
+        new = [[fx, 0, width - 1 - cx], [0, fy, height - 1 - cy]]
+    elif degrees == 90:  # (u, v) -> (H-1-v, u)
+        new = [[fy, 0, height - 1 - cy], [0, fx, cx]]
+    elif degrees == 270:  # (u, v) -> (v, W-1-u)
+        new = [[fy, 0, cy], [0, fx, width - 1 - cx]]
+    else:
+        return K
+    return np.array(new + [[0, 0, 1]], np.float32)
+
+
+class RotatedSource(Source):
+    """Rotate frames (and their intrinsics) clockwise by 90, 180 or 270 degrees, e.g. for a
+    camera mounted so that the operator's hands enter from the top of the image."""
+
+    def __init__(self, base: Source, degrees: int):
+        self.base, self.degrees, self.code = base, degrees, _ROTATIONS[degrees]
+
+    def read(self):
+        f = self.base.read()
+        if f is None:
+            return None
+        h, w = f.bgr.shape[:2]
+        f.K = rotate_K(np.asarray(f.K, np.float32), w, h, self.degrees)
+        f.bgr = cv2.rotate(f.bgr, self.code)
+        if f.depth_m is not None:
+            f.depth_m = cv2.rotate(f.depth_m, self.code)
+        return f
+
+    def rebase_clock(self):
+        self.base.rebase_clock()
+
+    def close(self):
+        self.base.close()
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 
 
@@ -450,10 +494,18 @@ def _open_base(spec, width, height, fps, intrinsics, realtime, loop, depth):
     raise ValueError(f"unrecognised source {spec!r}")
 
 
-def open_source(spec: str, *, width=1280, height=720, fps=30, intrinsics=None,
-                realtime=True, loop=False, depth=False, scale=1.0, zoom=1.0) -> Source:  # fmt: skip
-    """Open a source; undistort (if the calibration has distortion) and/or downscale."""
+def open_source(spec: str, *, width=1280, height=720, fps=30, intrinsics=None, realtime=True,
+                loop=False, depth=False, scale=1.0, zoom=1.0, rotate=0) -> Source:  # fmt: skip
+    """Open a source; undistort (if the calibration has distortion), downscale, rotate."""
+    src = _open_unrotated(spec, width, height, fps, intrinsics, realtime, loop, depth, scale, zoom)
+    return RotatedSource(src, rotate) if rotate else src
+
+
+def _open_unrotated(spec, width, height, fps, intrinsics, realtime, loop, depth, scale, zoom) -> Source:
     calibration = json.loads(Path(intrinsics).read_text()) if intrinsics else None
+    if calibration is None and (spec.startswith("webcam:") or spec.isdigit()):
+        log.warning("No --intrinsics for webcam; using f=max(w,h). Depth will be off "
+                    "(egohand-live calibrate-camera measures the lens).")
     distorted = calibration is not None and _is_distorted(calibration)
     # Distorted calibrations are applied by RectifiedSource, not as a plain K.
     src = _open_base(spec, width, height, fps, None if distorted else intrinsics,

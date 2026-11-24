@@ -29,7 +29,9 @@ def main():
 
     from inference.pipeline.predictor import EgoHandPredictor
 
-    eng = EgoHandEngine(EngineConfig(dtype=args.dtype, with_mesh=True))
+    # CUDA graphs wrap the shared model's forwards (and their outputs are overwritten on replay),
+    # so compare the plain eager path against upstream.
+    eng = EgoHandEngine(EngineConfig(dtype=args.dtype, with_mesh=True, cuda_graphs=False))
     upstream = EgoHandPredictor(eng.model, batch_size=2, device="cuda", dtype=eng.predictor.dtype)
     src = open_source(args.video, intrinsics=args.intrinsics, realtime=False, scale=args.scale)
 

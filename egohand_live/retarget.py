@@ -134,6 +134,12 @@ def serve(connect: str, publish: str, robot: str = "sharpa_wave", low_pass_alpha
     from .protocol import TOPIC_ROBOT, Subscriber, encode_robot_hands
 
     log = logging.getLogger("egohand_live.retarget")
+    try:  # a few-variable optimisation per hand: more intra-op threads only contend for cores
+        import torch
+
+        torch.set_num_threads(1)
+    except ImportError:
+        pass
     retargeters = {s: HandRetargeter(robot, s, low_pass_alpha=low_pass_alpha) for s in sides}
     last_seen = dict.fromkeys(sides, 0.0)
     sub = Subscriber(connect)

@@ -39,6 +39,7 @@ PYDEPS = REPO / "third_party" / "isaac_pydeps"
 sys.path[:0] = [str(REPO), str(PYDEPS), str(REPO / "isaac")]
 
 from isaaclab.app import add_launcher_args, launch_simulation  # noqa: E402
+import render_settings  # noqa: E402  (isaac/)
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--connect", default="tcp://localhost:5555", help="egohand-live hands publisher")
@@ -75,11 +76,13 @@ parser.add_argument("--control-every", type=int, default=2,
                     help="update hand/arm commands every N physics steps (2 = 60 Hz)")  # fmt: skip
 parser.add_argument("--max-seconds", type=float, default=0.0, help="quit after this long (0 = until closed)")
 parser.add_argument("--debug", action="store_true", help="print commanded vs simulated hand poses")
+render_settings.add_args(parser)
 add_launcher_args(parser)
 # CPU PhysX: for a handful of articulations it beats GPU physics, whose per-step GPU<->Python
 # syncs dominate here (measured ~4x faster control loop on an RTX 3080 Ti laptop).
 parser.set_defaults(device="cpu")
 args = parser.parse_args()
+render_settings.configure_launch(args)
 if not getattr(args, "visualizer", None) and not getattr(args, "headless", False):
     args.visualizer = "kit"  # Isaac Lab 3 opens no viewport unless a visualizer is requested
 
@@ -148,6 +151,10 @@ def start_retarget_server() -> tuple[str, subprocess.Popen]:
     url = f"tcp://127.0.0.1:{port}"
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO), str(PYDEPS), env.get("PYTHONPATH")) if p)
+    # One small optimisation per hand: extra BLAS/OpenMP threads only fight Kit, PhysX and the
+    # tracker for cores (seen as 10-20x slower retargeting when the laptop is busy).
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        env.setdefault(var, "1")
     cmd = [sys.executable, "-m", "egohand_live.cli", "retarget", "--connect", args.connect,
            "--publish", url, "--robot", args.robot, "--lowpass", str(args.lowpass)]  # fmt: skip
 
@@ -416,6 +423,7 @@ def main():
     retarget_url, retarget_proc = (args.retarget_connect, None) if args.retarget_connect else start_retarget_server()
     sim_cfg = sim_utils.SimulationCfg(dt=1 / 120, render_interval=args.render_every, device=args.device)
     with launch_simulation(sim_cfg, args):
+        render_settings.apply(args.render)
         sim = SimulationContext(sim_cfg)
         T_view = T_override if T_override is not None else T_default
         view = args.view or ("overview" if args.rig == "franka" else "camera")
@@ -524,7 +532,7 @@ def main():
             slack = next_wall - time.perf_counter()
             if slack > 0:
                 time.sleep(slack)
-            else:
+            elif slack < -0.1:  # far behind (a stall): drop the debt instead of racing to catch up
                 next_wall = time.perf_counter()
             if now - last_log > 5.0:
                 elapsed, last_log = now - last_log, now

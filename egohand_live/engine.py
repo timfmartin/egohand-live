@@ -32,13 +32,22 @@ class EngineConfig:
     detector_onnx: str | None = None  # default: HF nvidia/RT-DETR-Hand-Detector-v1
     soma_assets: str | None = None  # default: soma.get_assets_dir() (HF nvidia/SOMA-X)
     device: str = "cuda"
-    dtype: str = "bfloat16"
-    compile: bool = False  # torch.compile the DINOv3 blocks for batch 2
+    # fp16 lands 4x closer to fp32 than bf16 on EgoHand (0.3 vs 1.3 mm mean joint error), and
+    # fp16 GEMMs with fp16 accumulation run at 2x the fp32-accumulate tensor-core rate on GeForce
+    # cards (RTX 30xx laptop: DINOv3 batch 2 33 -> 28 ms compiled). Peak activation ~2.7e3 << 65504.
+    dtype: str = "float16"
+    fp16_accumulate: bool = True
+    cuda_graphs: bool = True  # backbone / hand head / kp2d head as CUDA graphs (per hand count)
+    detector_cuda_graph: bool = True  # RT-DETR via ORT IO binding + ORT CUDA graph
+    compile: bool = False  # torch.compile the DINOv3 blocks (1 and 2 hands; ~10 s first start)
     torch_threads: int = 4  # CPU intra-op threads; the per-frame path has only tiny CPU ops
     hands: tuple[str, ...] = HANDS
     with_mesh: bool = True
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
+    # Monocular depth correction: each hand is moved along its viewing ray to depth_scale x its
+    # estimated distance, keeping its size (measure with `egohand-live calibrate-depth`).
+    depth_scale: float = 1.0
 
 
 @dataclass
@@ -64,6 +73,7 @@ class FrameResult:
     K: np.ndarray
     hands: dict[str, HandResult]
     timings_ms: dict[str, float]
+    depth_scale: float = 1.0
 
 
 def _resolve_assets(cfg: EngineConfig) -> tuple[str, str, str]:
@@ -101,6 +111,9 @@ class EgoHandEngine:
         dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[
             cfg.dtype
         ]
+        torch.backends.cuda.matmul.allow_fp16_accumulation = bool(
+            cfg.fp16_accumulate and dtype == torch.float16
+        )
 
         from inference.hand_detector_2d.rtdetr.detector import _providers_for_device
         from inference.hand_detector_2d.rtdetr.onnx_model import HandDetector
@@ -111,9 +124,10 @@ class EgoHandEngine:
         model, _ = load_egohand_model(ckpt, soma_dir)
         model = model.eval().to(cfg.device)
         if cfg.compile:
-            model.backbone.enable_full_batch_compile(2)
+            _compile_backbone_blocks(model.backbone)
         self.model = model
-        self.predictor = LivePredictor(model, device=cfg.device, dtype=dtype, pad_to_two=True)
+        use_graphs = cfg.cuda_graphs and cfg.device.startswith("cuda")
+        self.predictor = LivePredictor(model, device=cfg.device, dtype=dtype, cuda_graphs=use_graphs)
         # The tracker needs sub-threshold candidates and does its own padding.
         self.detector = HandDetector(
             weights=onnx,
@@ -130,6 +144,9 @@ class EgoHandEngine:
                 "RT-DETR is running on CPU: onnxruntime could not load its CUDA provider "
                 "(missing CUDA 13 libraries? see scripts/setup.sh)."
             )
+            self._det_io = None
+        else:
+            self._det_io = _DetectorIO(onnx, cfg.device, cfg.detector_cuda_graph)
         # Right hands are the mirrored left-hand mesh (see predictor.py).
         left_faces = model.soma_hand.faces("left")
         self.faces = {"left": left_faces, "right": mirrored_faces(left_faces)}
@@ -148,6 +165,8 @@ class EgoHandEngine:
         """RT-DETR on one frame; returns unpadded ``Detection`` objects, score-sorted."""
         h, w = frame_bgr.shape[:2]
         small = cv2.resize(frame_bgr, (DETECTOR_INPUT, DETECTOR_INPUT), interpolation=cv2.INTER_AREA)
+        if self._det_io is not None:
+            return _postprocess(self.detector, *self._det_io(small, w, h), w, h)
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         batch = np.ascontiguousarray((rgb.astype(np.float32) * (1.0 / 255.0)).transpose(2, 0, 1)[None])
         # HandDetector's public API takes PIL images; _run takes the prepared tensor.
@@ -205,15 +224,19 @@ class EgoHandEngine:
             joints_raw = np.asarray(r["joints"], dtype=np.float64)
             if not np.isfinite(joints_raw).all() or joints_raw[0, 2] <= 0.05:
                 continue
+            ds = self.cfg.depth_scale
+            shift = (ds - 1.0) * joints_raw[0]  # root to ds x its distance, same ray
+            joints_raw = joints_raw + shift
             if trk.new:  # new track or side change: don't filter from another hand's state
                 self.smoothers[side].reset()
             joints = self.smoothers[side](joints_raw, t)
-            uv = joints @ K.T.astype(np.float64)
+            # overlay: undo the depth correction so the skeleton stays on the hand in the image
+            uv = (joints - (1.0 - 1.0 / ds) * joints[0]) @ K.T.astype(np.float64)
             kp2d = uv[:, :2] / np.maximum(uv[:, 2:], 1e-6)
             oxr_pos, oxr_quat, oxr_rad = soma25_to_openxr26(joints, side)
             verts = None
             if r["vertices"] is not None:  # shift the raw mesh with the smoothed wrist
-                verts = (r["vertices"] + (joints[0] - joints_raw[0])).astype(np.float32)
+                verts = (r["vertices"] + shift + (joints[0] - joints_raw[0])).astype(np.float32)
             hands[side] = HandResult(
                 side=side,
                 score=float(trk.score),
@@ -230,9 +253,83 @@ class EgoHandEngine:
         timings["post"] = (time.perf_counter() - t2) * 1e3
         timings["total"] = (time.perf_counter() - t0) * 1e3
 
-        result = FrameResult(self._index, t, (w, h), K, hands, timings)
+        result = FrameResult(self._index, t, (w, h), K, hands, timings, self.cfg.depth_scale)
         self._index += 1
         return result
+
+
+def _compile_backbone_blocks(backbone):
+    """Like DinoV3Backbone.enable_full_batch_compile(2), but for any batch size: each block gets
+    one static specialization per hand count. Runs inside the backbone's CUDA graph."""
+    backbone._compiled_blocks = [
+        torch.compile(b, backend="inductor", fullgraph=True, dynamic=False) for b in backbone.encoder.blocks
+    ]
+    backbone.forward = backbone._forward_compiled_spatial_features
+
+
+class _DetectorIO:
+    """RT-DETR fed through ORT IO binding: the resized uint8 frame goes up through a pinned
+    buffer, BGR->RGB / scaling / HWC->CHW run on the GPU (same float32 math as detect()), and the
+    whole ORT graph can be replayed as a CUDA graph (static 640x640 input, 300 queries)."""
+
+    def __init__(self, onnx_path, device, cuda_graph=True):
+        import onnxruntime as ort
+
+        dev = torch.device(device)
+        self.dev, idx = dev, dev.index or 0
+        opts = {"device_id": idx}
+        sess = None
+        if cuda_graph:
+            try:  # needs every node on the CUDA EP
+                sess = ort.InferenceSession(
+                    onnx_path, providers=[("CUDAExecutionProvider", {**opts, "enable_cuda_graph": "1"})]
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("ORT CUDA graph unavailable for RT-DETR (%s); running without", e)
+        self.sess = sess or ort.InferenceSession(onnx_path, providers=[("CUDAExecutionProvider", opts)])
+        s = DETECTOR_INPUT
+        self.host = torch.empty((s, s, 3), dtype=torch.uint8).pin_memory()
+        self.inp = torch.empty((1, 3, s, s), dtype=torch.float32, device=dev)
+        self.sizes = torch.zeros((1, 2), dtype=torch.int64, device=dev)
+        self.out = {
+            "labels": torch.empty((1, 300), dtype=torch.int64, device=dev),
+            "boxes": torch.empty((1, 300, 4), dtype=torch.float32, device=dev),
+            "scores": torch.empty((1, 300), dtype=torch.float32, device=dev),
+        }
+        np_type = {torch.int64: np.int64, torch.float32: np.float32}
+        self.io = self.sess.io_binding()
+        self.io.bind_input("images", "cuda", idx, np.float32, tuple(self.inp.shape), self.inp.data_ptr())
+        self.io.bind_input("orig_target_sizes", "cuda", idx, np.int64, (1, 2), self.sizes.data_ptr())
+        for name, t in self.out.items():
+            self.io.bind_output(name, "cuda", idx, np_type[t.dtype], tuple(t.shape), t.data_ptr())
+        self._wh = None
+
+    def __call__(self, small_bgr, w, h):
+        self.host.numpy()[:] = small_bgr
+        x = self.host.to(self.dev, non_blocking=True).flip(-1).permute(2, 0, 1)[None].float()
+        self.inp.copy_(x.mul_(1.0 / 255.0))
+        if self._wh != (w, h):
+            self.sizes.copy_(torch.tensor([[w, h]]))
+            self._wh = (w, h)
+        torch.cuda.current_stream(self.dev).synchronize()  # ORT runs on its own stream
+        self.sess.run_with_iobinding(self.io)  # returns after ORT's stream is done
+        return tuple(self.out[k].cpu().numpy() for k in ("labels", "boxes", "scores"))
+
+
+def _postprocess(det, labels, boxes, scores, w, h):
+    """HandDetector._run's per-image post-processing (score filter, sort, refine_box)."""
+    from inference.hand_detector_2d.rtdetr.onnx_model import LABELS, Detection, refine_box
+
+    lab, box, sc = labels[0], boxes[0], scores[0]
+    keep = sc > det.score_thr
+    dets = [
+        Detection(LABELS.get(int(l), str(int(l))), int(l), float(p), tuple(float(v) for v in b))
+        for l, b, p in zip(lab[keep], box[keep], sc[keep])
+    ]
+    dets.sort(key=lambda d: -d.score)
+    for d in dets:
+        d.xyxy = refine_box(d.xyxy, w, h, det.pad, det.square, det.min_size, det.clip)
+    return dets
 
 
 def slim_checkpoint(src: str | None, dst: str | Path) -> Path:

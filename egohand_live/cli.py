@@ -33,6 +33,8 @@ def _add_source_args(p):
     p.add_argument("--scale", type=float, default=1.0, help="downscale frames (e.g. 0.5) before tracking")
     p.add_argument("--zoom", type=float, default=1.0,
                    help="undistortion only: output focal multiplier (<1 keeps more of a wide FOV)")  # fmt: skip
+    p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                   help="rotate frames clockwise, e.g. 180 when your hands enter from the top of the image")  # fmt: skip
 
 
 def _percentiles(values):
@@ -54,15 +56,17 @@ def cmd_run(args):
         dtype=args.dtype,
         compile=args.compile,
         hands=hands,
-        with_mesh=bool(args.rerun),
+        with_mesh=bool(args.rerun or args.save_session),
         tracker=TrackerConfig(box_scale=args.box_scale, score_new=args.det_threshold,
                               handedness=args.handedness, min_confidence=args.min_confidence),
         smoothing=SmoothingConfig(enabled=not args.no_smooth),
+        depth_scale=args.depth_scale,
     )
     engine = EgoHandEngine(cfg)
     source = open_source(args.source, width=args.width, height=args.height, fps=args.fps,
                          intrinsics=args.intrinsics, realtime=not args.no_realtime,
-                         loop=args.loop, scale=args.scale, zoom=args.zoom)  # fmt: skip
+                         loop=args.loop, scale=args.scale, zoom=args.zoom,
+                         rotate=args.rotate)  # fmt: skip
     first = source.read()
     if first is None:
         raise SystemExit("source produced no frames")
@@ -81,6 +85,19 @@ def cmd_run(args):
         from .viz import RerunLogger
 
         rr_logger = RerunLogger(args.rerun, faces=engine.faces)
+    session = None
+    if args.save_session:
+        from .session import SessionWriter
+
+        session = SessionWriter(args.save_session, {
+            "source": args.source,
+            "image_size": [int(first.bgr.shape[1]), int(first.bgr.shape[0])],
+            "T_world_camera": np.loadtxt(args.extrinsics).reshape(4, 4).tolist() if args.extrinsics else None,
+            "depth_scale": args.depth_scale,
+            "intrinsics": args.intrinsics,
+            "rotate": args.rotate,
+        }, faces=engine.faces)  # fmt: skip
+        log.info("Saving the session to %s", args.save_session)
     if args.show:
         import cv2
 
@@ -115,6 +132,8 @@ def cmd_run(args):
             publisher.publish(result, frame.bgr if args.publish_frames else None)
         if rr_logger:
             rr_logger.log(frame.bgr, result)
+        if session:
+            session.add(frame.bgr, result)
         if args.show or writer is not None or args.record:
             vis = draw_overlay(frame.bgr, result.hands, rate.fps, latency,
                                {k: result.timings_ms[k] for k in ("detect", "egohand")})  # fmt: skip
@@ -143,6 +162,10 @@ def cmd_run(args):
         frame = source.read()
 
     source.close()
+    if session:
+        session.close()
+        print(f"session saved to {args.save_session} ({session.written} frames, {session.dropped} dropped); "
+              f"make a video with: egohand-live render-video {args.save_session}")
     if writer is not None:
         writer.release()
     if publisher:
@@ -166,7 +189,8 @@ def cmd_camera_server(args):
 
     source = open_source(args.source, width=args.width, height=args.height, fps=args.fps,
                          intrinsics=args.intrinsics, realtime=not args.no_realtime,
-                         loop=args.loop, scale=args.scale, zoom=args.zoom)  # fmt: skip
+                         loop=args.loop, scale=args.scale, zoom=args.zoom,
+                         rotate=args.rotate)  # fmt: skip
     sock = zmq.Context.instance().socket(zmq.PUB)
     sock.setsockopt(zmq.SNDHWM, 2)
     endpoint = args.connect or args.bind
@@ -245,6 +269,91 @@ def cmd_calibrate_desk(args):
         run(args.serial, args.frames, d405_mount=args.d405_mount, out=args.out, preview=args.preview)
 
 
+def cmd_calibrate_desk_hands(args):
+    from .calibrate import desk_from_hands
+
+    desk_from_hands(args.connect, args.out, args.spots)
+
+
+def cmd_calibrate_desk_board(args):
+    from .calibrate import desk_from_board
+
+    desk_from_board(args.source, args.out, args.board, args.intrinsics, args.rotate, args.board_height_mm,
+                    args.frames, args.width, args.height)  # fmt: skip
+
+
+def cmd_calibrate_depth(args):
+    from .calibrate import depth_scale_from_hands
+
+    depth_scale_from_hands(args.connect, args.extrinsics, args.spots)
+
+
+def cmd_calibrate_camera(args):
+    from .camcal import run
+
+    run(args.source, args.out, args.width, args.height, args.fps, args.board, args.views,
+        show_pattern=args.show_pattern, write_pattern=args.write_pattern, model=args.model)  # fmt: skip
+
+
+def cmd_preview(args):
+    """Live camera view with framing guides, for aiming a camera before tracking."""
+    import cv2
+
+    from .sources import open_source
+
+    rotations = [0, 90, 180, 270]
+    codes = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    rot = args.rotate
+    src = open_source(args.source, width=args.width, height=args.height, fps=args.fps,
+                      intrinsics=args.intrinsics, zoom=args.zoom)  # fmt: skip
+    win = "egohand-live preview (r: rotate, s: snapshot, q: quit)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    stamps: list[float] = []
+    try:
+        while True:
+            f = src.read()
+            if f is None:
+                continue
+            img = cv2.rotate(f.bgr, codes[rot]) if rot else f.bgr.copy()
+            h, w = img.shape[:2]
+            stamps = [t for t in stamps if f.t - t < 1.0] + [f.t]
+            for i in (1, 2):  # thirds
+                cv2.line(img, (w * i // 3, 0), (w * i // 3, h), (200, 200, 200), 1, cv2.LINE_AA)
+                cv2.line(img, (0, h * i // 3), (w, h * i // 3), (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.drawMarker(img, (w // 2, h // 2), (0, 255, 255), cv2.MARKER_CROSS, 40, 2)
+            cv2.rectangle(img, (0, h - 12), (w, h), (0, 200, 0), -1)
+            lines = [
+                f"{w}x{h}  {len(stamps)} fps  --rotate {rot}",
+                "aim: desk work area in the middle, your forearms entering at the green (bottom) edge",
+            ]
+            for i, text in enumerate(lines):
+                y = 36 + 34 * i
+                cv2.putText(img, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5, cv2.LINE_AA)
+                cv2.putText(img, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.imshow(win, img)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("r"):
+                rot = rotations[(rotations.index(rot) + 1) % 4]
+            elif key == ord("s"):
+                path = f"outputs/preview_{time.strftime('%H%M%S')}.jpg"
+                os.makedirs("outputs", exist_ok=True)
+                cv2.imwrite(path, cv2.rotate(f.bgr, codes[rot]) if rot else f.bgr)
+                print(f"saved {path}")
+            elif key in (ord("q"), 27):
+                break
+    finally:
+        src.close()
+        cv2.destroyAllWindows()
+    print(f"use --rotate {rot} with egohand-live run")
+
+
+def cmd_render_video(args):
+    from .video import render
+
+    render(args.session, args.out, args.size, args.fps, args.layers, args.step_seconds, args.aspect,
+           not args.no_captions, args.start, args.end)  # fmt: skip
+
+
 def cmd_synthetic(args):
     import numpy as np
 
@@ -265,7 +374,7 @@ def main(argv=None):
     _add_source_args(r)
     r.add_argument("--checkpoint", help="EgoHand .ckpt (default: HF nvidia/EgoHand-v1)")
     r.add_argument("--device", default="cuda")
-    r.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    r.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     r.add_argument("--compile", action="store_true", help="torch.compile DINOv3 blocks (slow first start)")
     r.add_argument("--hands", default="both", choices=["both", "left", "right"])
     r.add_argument("--box-scale", type=float, default=1.3, help="crop side / detector box side")
@@ -276,10 +385,16 @@ def main(argv=None):
     r.add_argument("--handedness", choices=("position", "detector"), default="position",
                    help="left/right from image position (camera behind/above the operator; robust "
                         "to palm-facing hands) or from the detector's class label")
+    r.add_argument("--depth-scale", type=float, default=1.0,
+                   help="move hands along their viewing ray to this x their estimated distance "
+                        "(monocular depth bias; measure with calibrate-depth)")
     r.add_argument("--no-smooth", action="store_true", help="disable One Euro smoothing")
     r.add_argument("--show", action="store_true", help="OpenCV window with overlay")
     r.add_argument("--record", help="write overlay video to this .mp4")
     r.add_argument("--record-fps", type=float, default=30.0)
+    r.add_argument("--save-session", metavar="DIR",
+                   help="save frames + per-frame results (joints, hand mesh) to render videos later "
+                        "(egohand-live render-video DIR)")
     r.add_argument("--rerun", nargs="?", const="spawn",
                    help="Rerun: 'spawn', rerun+http://HOST:9876/proxy, or file.rrd")
     r.add_argument("--publish", nargs="?", const="tcp://*:5555", help="ZMQ PUB endpoint")
@@ -318,6 +433,67 @@ def main(argv=None):
                     help="live view for setting up the camera: pose readout, sim desk outline, s saves --out")
     cd.set_defaults(func=cmd_calibrate_desk)
 
+    ch = sub.add_parser("calibrate-desk-hands",
+                        help="camera pose over the desk from hand touches (any camera, no target needed)")
+    ch.add_argument("--connect", default="tcp://localhost:5555", help="running `egohand-live run --publish`")
+    ch.add_argument("--out", default="outputs/T_world_camera.txt")
+    ch.add_argument("--spots", type=int, default=6, help="minimum spots (more are asked for until they cover an area)")
+    ch.set_defaults(func=cmd_calibrate_desk_hands)
+
+    cb = sub.add_parser("calibrate-desk-board",
+                        help="camera pose over the desk from a checkerboard lying on it (phone or print)")
+    _add_source_args(cb)
+    cb.add_argument("--board", required=True,
+                    help="board with its size: charuco:COLSxROWS:SQUARE_MM:MARKER_MM:DICT, charuco:auto:SQUARE_MM, "
+                         "or checker:COLSxROWS:SQUARE_MM (inner corners)")
+    cb.add_argument("--board-height-mm", type=float, default=0.0,
+                    help="board surface above the desk (printed board 0, phone lying on its back ~8)")
+    cb.add_argument("--frames", type=int, default=30, help="views to average")
+    cb.add_argument("--out", default="outputs/T_world_camera.txt")
+    cb.set_defaults(func=cmd_calibrate_desk_board)
+
+    cz = sub.add_parser("calibrate-depth",
+                        help="monocular depth scale (run --depth-scale) from hands resting on the desk")
+    cz.add_argument("--connect", default="tcp://localhost:5555", help="running `egohand-live run --publish`")
+    cz.add_argument("--extrinsics", required=True, help="T_world_camera from calibrate-desk-board")
+    cz.add_argument("--spots", type=int, default=6)
+    cz.set_defaults(func=cmd_calibrate_depth)
+
+    cc = sub.add_parser("calibrate-camera", help="lens intrinsics from a checkerboard or ChArUco board -> --intrinsics JSON")
+    cc.add_argument("--source", default="webcam:0", help="webcam:N | realsense | video:PATH")
+    cc.add_argument("--width", type=int, default=1280)
+    cc.add_argument("--height", type=int, default=720)
+    cc.add_argument("--fps", type=int, default=30)
+    cc.add_argument("--out", default="outputs/camera_intrinsics.json")
+    cc.add_argument("--board", default="checker:9x6",
+                    help="checker:COLSxROWS (inner corners; phone or print), charuco:COLSxROWS:SQUARE_MM:MARKER_MM:DICT "
+                         "or charuco:auto (printed ChArUco; covers the image corners of wide lenses)")
+    cc.add_argument("--model", default="auto", choices=("auto", "standard", "rational", "kb4"),
+                    help="lens model; auto fits all and keeps the best (kb4 = fisheye)")
+    cc.add_argument("--views", type=int, default=20, help="views to capture")
+    cc.add_argument("--show-pattern", action="store_true",
+                    help="show the checkerboard full-screen here (hold or tilt this screen under the camera)")
+    cc.add_argument("--write-pattern", help="also save the checkerboard as an image (for a phone or printer)")
+    cc.set_defaults(func=cmd_calibrate_camera)
+
+    pv = sub.add_parser("preview", help="live camera view with framing guides (for aiming the camera)")
+    _add_source_args(pv)
+    pv.set_defaults(func=cmd_preview)
+
+    rv = sub.add_parser("render-video", help="render a saved session (run --save-session) as a step-by-step video")
+    rv.add_argument("session", help="session folder")
+    rv.add_argument("--out", help="output .mp4 (default: SESSION/video.mp4)")
+    rv.add_argument("--size", default="1920x1080")
+    rv.add_argument("--fps", type=float, default=30.0)
+    rv.add_argument("--layers", help="fixed layer stack instead of the timeline, e.g. camera,mesh "
+                                     "(camera, skeleton, pose3d, mesh)")
+    rv.add_argument("--step-seconds", type=float, default=4.0, help="duration of each timeline step")
+    rv.add_argument("--aspect", default="16:9", choices=["16:9", "1:1", "9:16"], help="crop around the hands")
+    rv.add_argument("--no-captions", action="store_true")
+    rv.add_argument("--start", type=float, default=0.0, help="skip this many seconds")
+    rv.add_argument("--end", type=float, help="stop at this many seconds")
+    rv.set_defaults(func=cmd_render_video)
+
     sy = sub.add_parser("synthetic", help="publish synthetic moving/grasping hands (test the sim without a camera)")
     sy.add_argument("--publish", default="tcp://*:5555", help="ZMQ endpoint (bind with * or connect)")
     sy.add_argument("--extrinsics", help="4x4 T_world_camera to express the hands in (default: built-in)")
@@ -348,7 +524,7 @@ def main(argv=None):
                         datefmt="%H:%M:%S")  # fmt: skip
     if hasattr(args, "source"):
         args.source_is_live = not (
-            args.no_realtime and not args.source.startswith(("realsense", "webcam", "tcp://"))
+            getattr(args, "no_realtime", False) and not args.source.startswith(("realsense", "webcam", "tcp://"))
         )
     args.func(args)
 

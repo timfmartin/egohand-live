@@ -15,6 +15,7 @@ bytes with the shape given here:
     frame          "opencv_camera": +X right, +Y down, +Z forward, meters
     T_world_camera (4, 4) or nil, optional fixed camera extrinsic
     latency_ms     {stage: float}
+    depth_scale    float, monocular depth correction applied (``run --depth-scale``)
     hands          list of:
         side                 "left" | "right"
         score, held          detector confidence; held = box carried over a missed detection
@@ -88,6 +89,7 @@ def encode_hands(result, T_world_camera=None) -> bytes:
         "frame": "opencv_camera",
         "T_world_camera": None if T_world_camera is None else _arr(T_world_camera),
         "latency_ms": {k: round(float(v), 3) for k, v in result.timings_ms.items()},
+        "depth_scale": float(getattr(result, "depth_scale", 1.0)),
         "hands": hands,
     }
     return msgpack.packb(msg, use_bin_type=True)

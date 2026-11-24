@@ -29,6 +29,9 @@ take a few minutes.
 ~/isaacsim/python.sh isaac/sharpa_hands.py --connect tcp://TRACKING_HOST:5555 --extrinsics T_world_camera.txt --rig franka
 ```
 
+`isaac/arm_teleop.py` drives Isaac Lab manipulation tasks with a parallel gripper instead (see
+[Gripper teleoperation](#gripper-teleoperation-and-demonstrations)).
+
 Without a camera, start `egohand-live synthetic --publish "tcp://*:5555"` (any Python with the
 repo installed) and connect to `tcp://localhost:5555` without `--extrinsics`: the synthetic
 hands carry their own camera pose.
@@ -55,6 +58,34 @@ reached all poses there, against ~75 % with the mount at desk height.
 In both rigs the fingers are position-driven with Sharpa's gains and the hand colliders get a
 high-friction material for grasping.
 
+## Gripper teleoperation and demonstrations
+
+```bash
+~/isaacsim/python.sh isaac/arm_teleop.py --extrinsics T_world_camera.txt
+~/isaacsim/python.sh isaac/arm_teleop.py --extrinsics T_world_camera.txt --record demos/stack.hdf5 --num-demos 10
+```
+
+The script loads an Isaac Lab task whose actions are an absolute end-effector pose and a gripper
+(default `IsaacContrib-Stack-Cube-Franka-IK-Abs`, Franka cube stacking) and steps it from your
+right hand (`--hand left` for the other):
+
+- The fingertip centre of the gripper follows the point between your thumb and index fingertips;
+  `--rotation yaw` (default) keeps the gripper pointing down and turns it with your hand, `full`
+  follows the whole hand orientation.
+- A thumb–index pinch closes the gripper below 3 cm and opens it above 5 cm, the rule of NVIDIA
+  Isaac Teleop's `GripperRetargeter`. `--gripper continuous` replaces the task's open/close action
+  with a joint-position action so the opening follows the pinch width.
+- Your desk maps onto the task's table with you behind the robot: the workspace centre of the
+  calibration (the board position) lands on `--task-centre` (0.5, 0); `--motion-scale` scales
+  your motion about it.
+- `--record` saves successful episodes (the task's success condition held for
+  `--num-success-steps`) with Isaac Lab's recorder manager, the same HDF5 format as Isaac Lab's
+  `record_demos.py`, for `replay_demos.py` and GR00T-Mimic.
+
+Keys: R discards the episode and resets, SPACE pauses. `--debug` prints commanded vs. actual
+gripper position once a second. The hand-to-gripper math is in
+[egohand_live/gripper_teleop.py](../egohand_live/gripper_teleop.py) and runs without a simulator.
+
 ## Retargeting
 
 [egohand_live/retarget.py](../egohand_live/retarget.py) uses dex-retargeting's DexPilot with the
@@ -72,6 +103,7 @@ on topic `robot`, for other simulators or a ROS bridge.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--rig` | `floating` | `floating` hands or `franka` (FR3 Duo) |
+| `--render` | `minimal` | viewport: `minimal` (lightest), `fast` (RT2 without costly effects), `quality` (full RTX, for videos); `--render-size WxH` |
 | `--scene` | `simready` | `simready` desk props, `cubes`, or `empty` |
 | `--simready-root` | `third_party/simready` | folder with `nvidia/…` and `frankarobotics/…` (or `$SIMREADY_ROOT`) |
 | `--extrinsics` | – | `T_world_camera` file; else the one in the messages, else `--camera-height` / `--camera-tilt` |
@@ -88,7 +120,19 @@ on topic `robot`, for other simulators or a ROS bridge.
 
 ## Performance notes
 
-On an RTX 3080 Ti laptop the FR3 Duo scene runs at ~0.75x real time with CPU physics. Two things
-matter in Isaac Lab 3 when stepping a simulation by hand: `sim.step()` renders on every call unless
-told otherwise, and GPU physics pays a GPU-to-Python synchronisation for every state read, which
-dominates for a few articulations.
+With tracking on the same GPU, rendering is the expensive part. Isaac Lab cannot choose the Kit
+renderer, so Isaac Sim starts in RTX Real-Time 2.0 with DLSS, which NVIDIA's performance handbook
+notes can be slower on Ampere GPUs; [isaac/render_settings.py](../isaac/render_settings.py)
+switches the viewport after start-up (`--render`). On an RTX 3080 Ti laptop with tracking running,
+the Sharpa scene went from 0.62× real time with the GPU saturated to 1.0× real time at ~25 % GPU
+load with `--render minimal`.
+
+Other things that matter when stepping a simulation by hand in Isaac Lab 3:
+
+- `sim.step()` renders on every call unless told otherwise; `ManagerBasedRLEnv` tasks render
+  `render_interval`-often inside `env.step` (`arm_teleop.py` sets one render per step).
+- GPU physics pays a GPU-to-Python synchronisation for every state read, which dominates for a few
+  articulations, so the scripts default to CPU PhysX.
+- A wall-clock pacing loop must keep the time debt of slow (render) steps; resetting the schedule
+  on every overrun caps the real-time factor.
+- Isaac Lab 3 quaternions are XYZW.
