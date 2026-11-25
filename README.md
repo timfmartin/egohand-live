@@ -5,7 +5,7 @@
 [![tests](https://github.com/timfmartin/egohand-live/actions/workflows/tests.yml/badge.svg)](https://github.com/timfmartin/egohand-live/actions/workflows/tests.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-<!-- HERO VIDEO: ed https://github.com/user-attachments/assets/3cec19f6-a0be-4394-9323-57f78d2b6576  -->
+https://github.com/user-attachments/assets/3cec19f6-a0be-4394-9323-57f78d2b6576
 
 ![Camera, hand tracking, robot hands, Isaac Sim](docs/media/pipeline.jpg)
 
